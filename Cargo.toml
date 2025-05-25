@@ -1,0 +1,11 @@
+[package]
+name = "zeus-controller"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1.45.1", features = ["macros", "rt"]}
+tokio-modbus = { version = "*", default-features = false, features = ["rtu"] }
+tokio-serial = "5.4.5"
