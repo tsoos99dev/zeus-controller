@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -e
 
-source .env
+source .env.deploy
 
 ssh $SDK_SSH_HOST /bin/bash << ENDSSH 
 cd $REMOTE_PROJECT_DIR
