@@ -32,6 +32,8 @@ Session.vim
 config.mk
 config.stamp
 no_llvm_build
+config
+certs
 
 ## Build
 /dl/
@@ -95,4 +97,4 @@ flake.lock
 
 # Env
 .env
-.env.local
+.env.*
