@@ -1,8 +1,11 @@
 mod app_config;
 mod mqtt;
+mod ops;
+mod relay;
+mod service;
 
-use mqtt::Request;
-use tokio::{signal, sync::mpsc};
+use service::Service;
+use tokio::signal;
 
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -16,29 +19,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = CancellationToken::new();
     let cloned_token = token.clone();
 
-    let mut interface = mqtt::Interface::new(settings.mqtt, cloned_token);
+    let mut mqtt_interface = mqtt::Interface::new(settings.mqtt, cloned_token);
+    let relay_interface = relay::Interface::new("/dev/ttyS1", 1, 9600);
 
-    let (tx, mut rx) = mpsc::channel(5);
-    interface.add_handler("test", tx).await?;
+    let relay_proxy = relay_interface.spawn();
 
-    tracker.spawn(async move {
-        loop {
-            let Some(request) = rx.recv().await else {
-                println!("Task receive channel closed");
-                return;
-            };
-
-            let Request(data, resp_channel) = request;
-            println!("{:?}", data);
-            if let Err(e) = resp_channel.send(data) {
-                eprintln!("Task response channel closed: {:?}", e);
-            };
-        }
-    });
+    mqtt_interface
+        .add_handler("relay/command", relay_proxy)
+        .await?;
 
     tracker.spawn(async move {
-        if let Err(e) = interface.run().await {
-            eprintln!("Interface error: {:?}", e);
+        if let Err(e) = mqtt_interface.run().await {
+            eprintln!("Interface error: {e:?}");
         };
     });
 
@@ -47,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match signal::ctrl_c().await {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("Unable to listen for shutdown signal: {}", e);
+            eprintln!("Unable to listen for shutdown signal: {e}");
         }
     }
 

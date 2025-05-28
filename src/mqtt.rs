@@ -1,4 +1,7 @@
-use std::{collections::HashMap, string::FromUtf8Error, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, pin::Pin, string::FromUtf8Error, sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use rumqttc::{
@@ -20,11 +23,16 @@ use rumqttc::{
     v5::{mqttbytes::v5::Packet, AsyncClient, Event, MqttOptions},
     Transport,
 };
-use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, Semaphore};
 use tokio_rustls::rustls::pki_types;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::app_config::{MQTTSettings, TLSSettings};
+use crate::{
+    app_config::{MQTTSettings, TLSSettings},
+    ops::AsyncFn,
+    service::{Proxy, ServiceError},
+};
 
 // Number of messages allowed in the async client's buffer
 const CLIENT_CHANNEL_CAPACITY: usize = 20;
@@ -38,8 +46,47 @@ const REQUEST_CONCURRENCY: usize = 5;
 // Max number of seconds to wait for an available handler before the packet is dropped
 const REQUEST_WAIT_PERIOD: u64 = 2;
 
+#[typetag::deserialize]
+pub trait Request {}
+
+#[typetag::serialize]
+pub trait Response {}
+
+type RequestProxyRegistry = Arc<
+    Mutex<
+        HashMap<
+            String,
+            Box<dyn AsyncFn<Args = Bytes, Ret = Result<Bytes, RequestError>> + Send + Sync>,
+        >,
+    >,
+>;
+
+// impl<T, F> AsyncFnOnce for T
+// where
+//     T: FnOnce(&Bytes) -> F,
+//     F: Future<Output = Bytes> + Send + Sync + 'static,
+// {
+//     type Args = Bytes;
+//     type Ret = Bytes;
+//     fn call(self, args: Bytes) -> Pin<Box<dyn Future<Output = Bytes> + Send + Sync>> {
+//         Box::pin(self(&args))
+//     }
+// }
+
+impl<T, F> AsyncFn for T
+where
+    T: Fn(Bytes) -> F,
+    F: Future<Output = Result<Bytes, RequestError>> + Send + Sync + 'static,
+{
+    type Args = Bytes;
+    type Ret = Result<Bytes, RequestError>;
+    fn call(&self, args: Self::Args) -> Pin<Box<dyn Future<Output = Self::Ret> + Send + Sync>> {
+        Box::pin(self(args))
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
-enum TLSSettingError {
+pub enum TLSSettingError {
     #[error("Failed to load root certificate")]
     RootCertLoad(#[source] pki_types::pem::Error),
 
@@ -60,7 +107,7 @@ enum TLSSettingError {
 }
 
 #[derive(thiserror::Error, Debug)]
-enum RequestError {
+pub enum RequestError {
     #[error("Too many requests")]
     TooManyRequests,
 
@@ -75,21 +122,17 @@ enum RequestError {
 
     #[error("Missing correlation data")]
     MissingCorrelationData,
+    #[error("Invalid request format")]
+    InvalidRequestFormat(#[from] serde_json::Error),
 
-    #[error("Invalid payload format")]
-    InvalidPayloadFormat(#[from] rmp_serde::decode::Error),
-
-    #[error("Handler dropped request")]
-    HandlerDroppedRequest,
-
-    #[error("Handler not listening")]
-    HandlerNotListening,
+    #[error("Handler failed")]
+    HandlerFailed(#[from] ServiceError),
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum InterfaceError {
     #[error("Couldn't disconnect cleanly")]
-    DisconnectFailed(#[from] ClientError),
+    DisconnectFailed(#[from] Box<ClientError>),
 
     #[error("Executor already running")]
     AlreadyRunning,
@@ -123,17 +166,11 @@ fn set_tls_settings(
     Ok(mqttoptions)
 }
 
-#[derive(Debug)]
-pub struct Request(pub Bytes, pub oneshot::Sender<Bytes>);
-type RequestHandle = mpsc::Sender<Request>;
-type RequestHandleRegistry = Arc<Mutex<HashMap<String, RequestHandle>>>;
-
 pub struct Interface {
     client: AsyncClient,
     executor: Option<InterfaceExecutor>,
-    request_handle_registry: RequestHandleRegistry,
-    external_cancellation_token: CancellationToken,
-    internal_cancellation_token: CancellationToken,
+    proxies: RequestProxyRegistry,
+    token: CancellationToken,
 }
 
 impl Interface {
@@ -147,68 +184,86 @@ impl Interface {
 
         let (client, eventloop) = AsyncClient::new(options.clone(), CLIENT_CHANNEL_CAPACITY);
 
-        let internal_cancellation_token = CancellationToken::new();
-
-        let request_handle_registry = Arc::new(Mutex::new(HashMap::new()));
+        let proxies = Arc::new(Mutex::new(HashMap::new()));
         let executor = InterfaceExecutor {
             eventloop,
-            request_handler: RequestHandler::new(client.clone(), request_handle_registry.clone()),
-            cancellation_token: internal_cancellation_token.clone(),
+            request_handler: RequestHandler::new(client.clone(), proxies.clone()),
         };
 
         Interface {
             client,
             executor: Some(executor),
-            request_handle_registry,
-            external_cancellation_token: token,
-            internal_cancellation_token,
+            proxies,
+            token,
         }
     }
 
     pub async fn run(&mut self) -> Result<(), InterfaceError> {
         let tracker = TaskTracker::new();
 
-        let internal_cancellation_token_clone = self.internal_cancellation_token.clone();
+        // let internal_cancellation_token_clone = self.internal_cancellation_token.clone();
         let mut executor = self.executor.take().ok_or(InterfaceError::AlreadyRunning)?;
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
 
         tracker.spawn(async move {
             tokio::select! {
                 _ = executor.poll() => {},
-                _ = internal_cancellation_token_clone.cancelled() => {}
+                _ = token_clone.cancelled() => {}
             }
         });
 
-        self.external_cancellation_token.cancelled().await;
+        self.token.cancelled().await;
+
         tracker.close();
 
         let state = self
             .client
             .disconnect()
             .await
-            .map_err(InterfaceError::DisconnectFailed)
-            .inspect_err(|_| self.internal_cancellation_token.cancel());
+            .map_err(|e| InterfaceError::DisconnectFailed(Box::new(e)));
 
+        token.cancel();
         tracker.wait().await;
         state
     }
 
-    pub async fn add_handler(&self, topic: &str, handle: RequestHandle) -> Result<(), ClientError> {
-        let mut r = self.request_handle_registry.lock().await;
-        r.insert(topic.into(), handle);
-        self.client.subscribe(topic, QoS::AtMostOnce).await
+    pub async fn add_handler<M, R>(
+        &self,
+        topic: &str,
+        proxy: Proxy<M, R>,
+    ) -> Result<(), ClientError>
+    where
+        M: for<'a> Deserialize<'a> + Clone + Send + Sync + 'static,
+        R: Serialize + Clone + Send + Sync + 'static,
+    {
+        let mut proxies = self.proxies.lock().await;
+        let converter = Box::new(move |request: Bytes| {
+            let proxy = proxy.clone();
+            async move {
+                let message = serde_json::from_slice(&request)?;
+                let response = proxy.send(message).await?;
+                let response = serde_json::to_vec(&response)?;
+                Ok(response.into())
+            }
+        });
+
+        proxies.insert(topic.into(), converter);
+        self.client.subscribe(topic, QoS::AtMostOnce).await?;
+        Ok(())
     }
 
-    pub async fn publish(&self, topic: &str, data: Bytes) -> Result<(), ClientError> {
-        self.client
-            .publish_bytes(topic, QoS::AtMostOnce, false, data)
-            .await
-    }
+    // pub async fn publish(&self, topic: &str, data: Bytes) -> Result<(), ClientError> {
+    //     self.client
+    //         .publish_bytes(topic, QoS::AtMostOnce, false, data)
+    //         .await
+    // }
 }
 
 struct InterfaceExecutor {
     eventloop: EventLoop,
     request_handler: RequestHandler,
-    cancellation_token: CancellationToken,
 }
 
 impl InterfaceExecutor {
@@ -217,7 +272,7 @@ impl InterfaceExecutor {
             let event = self.eventloop.poll().await;
             match event {
                 Ok(notification) => {
-                    println!("Received = {:?}", notification);
+                    println!("Received = {notification:?}");
                     match notification {
                         Event::Incoming(Packet::ConnAck(packet)) => {
                             println!("Client connected: {:?}", packet.code);
@@ -226,12 +281,11 @@ impl InterfaceExecutor {
                             println!("Client disconnected: {:?}", packet.reason_code);
                         }
                         Event::Outgoing(Outgoing::Disconnect) => {
-                            println!("Closing...");
-                            self.cancellation_token.cancel();
+                            println!("Disconnecting...");
                         }
                         Event::Incoming(Packet::Publish(packet)) => {
                             if let Err(e) = self.request_handler.accept(packet).await {
-                                eprintln!("Failed to process request: {:?}", e);
+                                eprintln!("Failed to process request: {e:?}");
                             };
                         }
                         _ => {}
@@ -249,15 +303,15 @@ impl InterfaceExecutor {
 #[derive(Clone)]
 struct RequestHandler {
     client: AsyncClient,
-    handles: RequestHandleRegistry,
+    proxies: RequestProxyRegistry,
     request_semaphore: Arc<Semaphore>,
 }
 
 impl RequestHandler {
-    fn new(client: AsyncClient, handles: RequestHandleRegistry) -> Self {
+    fn new(client: AsyncClient, proxies: RequestProxyRegistry) -> Self {
         RequestHandler {
             client,
-            handles,
+            proxies,
             request_semaphore: Arc::new(Semaphore::new(REQUEST_CONCURRENCY)),
         }
     }
@@ -282,32 +336,21 @@ impl RequestHandler {
             .correlation_data
             .ok_or(RequestError::MissingCorrelationData)?;
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-
-        let handles = self.handles.lock().await;
-        let Some(request_handle) = handles.get(&topic) else {
-            return Ok(());
-        };
-
-        let request_handle = request_handle.clone();
-
+        let proxies = self.proxies.clone();
         let client = self.client.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = request_handle
-                .send(Request(packet.payload, resp_tx))
-                .await
-                .map_err(|_| RequestError::HandlerNotListening)
-            {
-                eprintln!("Request error: {:?}", e);
-                drop(permit);
+            let proxies = proxies.lock().await;
+            let Some(proxy) = proxies.get(&topic) else {
                 return;
-            }
+            };
 
-            let Ok(response) = resp_rx.await else {
-                eprintln!("Request error: {:?}", RequestError::HandlerDroppedRequest);
-                drop(permit);
-                return;
+            let response = match proxy.call(packet.payload).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Request handler failed: {e}");
+                    return;
+                }
             };
 
             let properties = PublishProperties {
@@ -325,9 +368,8 @@ impl RequestHandler {
                 )
                 .await
             {
-                eprintln!("Failed to publish response: {:?}", e);
+                eprintln!("Failed to publish response: {e}");
             };
-
             drop(permit);
         });
 
