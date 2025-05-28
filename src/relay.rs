@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::Duration};
 
 use client::Context;
 use serde::{self, Deserialize, Serialize};
@@ -63,8 +63,9 @@ pub enum InterfaceError {
     #[error("Failed to connect to relay")]
     FailedToConnect(#[source] IOError),
 
-    // #[error("Invalid response")]
-    // InvalidResponse,
+    #[error("Timeout")]
+    Timeout,
+
     #[error(transparent)]
     RequestFailed(#[from] RequestFailureKind),
 
@@ -93,14 +94,16 @@ pub struct Interface {
     device: String,
     unit_id: u8,
     baud_rate: u32,
+    timeout: Duration,
 }
 
 impl Interface {
-    pub fn new(device: &str, unit_id: u8, baud_rate: u32) -> Self {
+    pub fn new(device: &str, unit_id: u8, baud_rate: u32, timeout: Duration) -> Self {
         Interface {
             device: String::from(device),
             unit_id,
             baud_rate,
+            timeout,
         }
     }
 
@@ -127,8 +130,10 @@ impl Interface {
         let mut ctx = self
             .create_ctx()
             .map_err(|e| InterfaceError::FailedToConnect(IOError(e.kind())))?;
-        ctx.write_single_coil(number, value)
+
+        tokio::time::timeout(self.timeout, ctx.write_single_coil(number, value))
             .await
+            .map_err(|_| InterfaceError::Timeout)?
             .map_err(|e| RequestFailureKind::Connection(TokioModbusError(e.to_string())))?
             .map_err(|e| RequestFailureKind::Modbus(TokioModbusExceptionCode(e)))?;
 

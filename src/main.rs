@@ -4,6 +4,8 @@ mod ops;
 mod relay;
 mod service;
 
+use std::time::Duration;
+
 use service::Service;
 use tokio::signal;
 
@@ -20,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cloned_token = token.clone();
 
     let mut mqtt_interface = mqtt::Interface::new(settings.mqtt, cloned_token)?;
-    let relay_interface = relay::Interface::new("/dev/ttyS1", 1, 9600);
+    let relay_interface = relay::Interface::new("/dev/ttyS1", 1, 9600, Duration::from_secs(3));
 
     let relay_proxy = relay_interface.spawn();
 
