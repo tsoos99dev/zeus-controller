@@ -17,13 +17,18 @@ const DEFAULT_LOGGING: &str = "info";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let log_config = std::env::var("RUST_LOG").map(|l| {
-        if l.is_empty() {
-            DEFAULT_LOGGING.to_owned()
-        } else {
-            l
-        }
-    })?;
+    let log_config = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|l| {
+            if l.is_empty() {
+                {
+                    None
+                }
+            } else {
+                Some(l)
+            }
+        })
+        .unwrap_or_else(|| DEFAULT_LOGGING.to_owned());
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
         .with_env_filter(log_config)
         .finish();
