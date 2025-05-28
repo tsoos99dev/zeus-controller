@@ -174,6 +174,7 @@ pub struct Interface {
     executor: Option<InterfaceExecutor>,
     proxies: RequestProxyRegistry,
     token: CancellationToken,
+    internal_token: CancellationToken,
 }
 
 impl Interface {
@@ -188,12 +189,15 @@ impl Interface {
             set_tls_settings(&mut options, tls_settings)?;
         }
 
+        let internal_token = CancellationToken::new();
+
         let (client, eventloop) = AsyncClient::new(options.clone(), CLIENT_CHANNEL_CAPACITY);
 
         let proxies = Arc::new(Mutex::new(HashMap::new()));
         let executor = InterfaceExecutor {
             eventloop,
             request_handler: RequestHandler::new(client.clone(), proxies.clone()),
+            token: internal_token.clone(),
         };
 
         Ok(Interface {
@@ -201,22 +205,21 @@ impl Interface {
             executor: Some(executor),
             proxies,
             token,
+            internal_token,
         })
     }
 
     pub async fn run(&mut self) -> Result<(), InterfaceError> {
         let tracker = TaskTracker::new();
 
-        // let internal_cancellation_token_clone = self.internal_cancellation_token.clone();
         let mut executor = self.executor.take().ok_or(InterfaceError::AlreadyRunning)?;
 
-        let token = CancellationToken::new();
-        let token_clone = token.clone();
+        let internal_token_clone = self.internal_token.clone();
 
         tracker.spawn(async move {
             tokio::select! {
                 _ = executor.poll() => {},
-                _ = token_clone.cancelled() => {}
+                _ = internal_token_clone.cancelled() => {}
             }
         });
 
@@ -230,7 +233,10 @@ impl Interface {
             .await
             .map_err(|e| InterfaceError::DisconnectFailed(Box::new(e)));
 
-        token.cancel();
+        if state.is_err() {
+            self.internal_token.cancel();
+        }
+
         tracker.wait().await;
         state
     }
@@ -270,6 +276,7 @@ impl Interface {
 struct InterfaceExecutor {
     eventloop: EventLoop,
     request_handler: RequestHandler,
+    token: CancellationToken,
 }
 
 impl InterfaceExecutor {
@@ -288,6 +295,7 @@ impl InterfaceExecutor {
                         }
                         Event::Outgoing(Outgoing::Disconnect) => {
                             tracing::info!("Disconnecting...");
+                            self.token.cancel();
                         }
                         Event::Incoming(Packet::Publish(packet)) => {
                             if let Err(e) = self.request_handler.accept(packet).await {
