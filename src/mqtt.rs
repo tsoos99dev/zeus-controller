@@ -354,7 +354,7 @@ impl RequestHandler {
             let response = match proxy.call(packet.payload).await {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("Request handler failed: {e}");
+                    eprintln!("Request handler failed: {e:?}");
                     return;
                 }
             };
@@ -374,7 +374,7 @@ impl RequestHandler {
                 )
                 .await
             {
-                eprintln!("Failed to publish response: {e}");
+                eprintln!("Failed to publish response: {e:?}");
             };
             drop(permit);
         });
