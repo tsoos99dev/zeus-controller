@@ -13,9 +13,20 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use app_config::Settings;
 
+const DEFAULT_LOGGING: &str = "info";
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = tracing_subscriber::FmtSubscriber::new();
+    let log_config = std::env::var("RUST_LOG").map(|l| {
+        if l.is_empty() {
+            DEFAULT_LOGGING.to_owned()
+        } else {
+            l
+        }
+    })?;
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(log_config)
+        .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
     let settings = Settings::new()?;
