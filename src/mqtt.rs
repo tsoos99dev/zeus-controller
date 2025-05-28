@@ -278,27 +278,27 @@ impl InterfaceExecutor {
             let event = self.eventloop.poll().await;
             match event {
                 Ok(notification) => {
-                    println!("Received = {notification:?}");
+                    tracing::debug!("Received = {notification:?}");
                     match notification {
                         Event::Incoming(Packet::ConnAck(packet)) => {
-                            println!("Client connected: {:?}", packet.code);
+                            tracing::info!("Client connected: {:?}", packet.code);
                         }
                         Event::Incoming(Packet::Disconnect(packet)) => {
-                            println!("Client disconnected: {:?}", packet.reason_code);
+                            tracing::warn!("Client disconnected: {:?}", packet.reason_code);
                         }
                         Event::Outgoing(Outgoing::Disconnect) => {
-                            println!("Disconnecting...");
+                            tracing::info!("Disconnecting...");
                         }
                         Event::Incoming(Packet::Publish(packet)) => {
                             if let Err(e) = self.request_handler.accept(packet).await {
-                                eprintln!("Failed to process request: {e:?}");
+                                tracing::error!("Failed to process request: {e:?}");
                             };
                         }
                         _ => {}
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error = {e:?}");
+                    tracing::error!("Error = {e:?}");
                     tokio::time::sleep(Duration::from_secs(RETRY_DELAY)).await;
                 }
             }
@@ -354,7 +354,7 @@ impl RequestHandler {
             let response = match proxy.call(packet.payload).await {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("Request handler failed: {e:?}");
+                    tracing::error!("Request handler failed: {e:?}");
                     return;
                 }
             };
@@ -374,7 +374,7 @@ impl RequestHandler {
                 )
                 .await
             {
-                eprintln!("Failed to publish response: {e:?}");
+                tracing::error!("Failed to publish response: {e:?}");
             };
             drop(permit);
         });

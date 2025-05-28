@@ -15,7 +15,10 @@ use app_config::Settings;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let settings = Settings::new().expect("Failed to load app config");
+    let subscriber = tracing_subscriber::FmtSubscriber::new();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    let settings = Settings::new()?;
 
     let tracker = TaskTracker::new();
     let token = CancellationToken::new();
@@ -32,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracker.spawn(async move {
         if let Err(e) = mqtt_interface.run().await {
-            eprintln!("Interface error: {e:?}");
+            tracing::error!("Interface error: {e:?}");
         };
     });
 
@@ -41,18 +44,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match signal::ctrl_c().await {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("Unable to listen for shutdown signal: {e}");
+            tracing::error!("Unable to listen for shutdown signal: {e}");
         }
     }
 
-    println!("Shutting down...");
+    tracing::debug!("Shutting down...");
     token.cancel();
     relay_proxy.stop();
 
-    println!("Waiting for background tasks to finish...");
+    tracing::debug!("Waiting for background tasks to finish...");
     tracker.wait().await;
 
-    println!("Done.");
+    tracing::debug!("Done.");
 
     Ok(())
 }
