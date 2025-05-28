@@ -131,6 +131,9 @@ pub enum RequestError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum InterfaceError {
+    #[error("TLS config failed")]
+    TLSConfigFailed(#[from] TLSSettingError),
+
     #[error("Couldn't disconnect cleanly")]
     DisconnectFailed(#[from] Box<ClientError>),
 
@@ -174,12 +177,15 @@ pub struct Interface {
 }
 
 impl Interface {
-    pub fn new(client_settings: MQTTSettings, token: CancellationToken) -> Self {
+    pub fn new(
+        client_settings: MQTTSettings,
+        token: CancellationToken,
+    ) -> Result<Self, InterfaceError> {
         let mut options = MqttOptions::new("", client_settings.host, client_settings.port);
         options.set_connection_timeout(client_settings.connection_timeout.0);
 
         if let Some(tls_settings) = client_settings.tls {
-            set_tls_settings(&mut options, tls_settings).unwrap();
+            set_tls_settings(&mut options, tls_settings)?;
         }
 
         let (client, eventloop) = AsyncClient::new(options.clone(), CLIENT_CHANNEL_CAPACITY);
@@ -190,12 +196,12 @@ impl Interface {
             request_handler: RequestHandler::new(client.clone(), proxies.clone()),
         };
 
-        Interface {
+        Ok(Interface {
             client,
             executor: Some(executor),
             proxies,
             token,
-        }
+        })
     }
 
     pub async fn run(&mut self) -> Result<(), InterfaceError> {
