@@ -15,6 +15,7 @@ cd $REMOTE_PROJECT_DIR
 source $SDK_ENV_SETUP_SCRIPT
 git pull
 cargo build $CARGO_PROFILE_ARG --target $TARGET_TRIPLE
+$STRIP -s target/$TARGET_TRIPLE/$PROFILE/zeus-controller
 ENDSSH
 
 echo "Copying the binary..."
