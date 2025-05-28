@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relay_proxy = relay_interface.spawn();
 
     mqtt_interface
-        .add_handler("relay/command", relay_proxy)
+        .add_handler("relay/command", relay_proxy.clone())
         .await?;
 
     tracker.spawn(async move {
@@ -47,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Shutting down...");
     token.cancel();
+    relay_proxy.stop();
 
     println!("Waiting for background tasks to finish...");
     tracker.wait().await;

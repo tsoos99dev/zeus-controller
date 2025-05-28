@@ -32,13 +32,7 @@ impl<M, R> Proxy<M, R> {
         Ok(response)
     }
 
-    // pub fn stop(self) {
-    //     self.token.cancel();
-    // }
-}
-
-impl<M, R> Drop for Proxy<M, R> {
-    fn drop(&mut self) {
+    pub fn stop(self) {
         self.token.cancel();
     }
 }
