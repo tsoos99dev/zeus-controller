@@ -41,7 +41,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cloned_token = token.clone();
 
     let mut mqtt_interface = mqtt::Interface::new(settings.mqtt, cloned_token)?;
-    let relay_interface = relay::Interface::new("/dev/ttyS1", 1, 9600, Duration::from_secs(3));
+    let relay_interface = relay::Interface::new(
+        &settings.relay.device,
+        settings.relay.unit_id,
+        settings.relay.baud_rate,
+        Duration::from_secs(settings.relay.timeout.0),
+    );
 
     let relay_proxy = relay_interface.spawn();
 

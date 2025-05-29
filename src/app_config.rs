@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
 
@@ -28,8 +30,17 @@ pub struct MQTTSettings {
 }
 
 #[derive(Deserialize, Clone, Debug)]
+pub struct RelaySettings {
+    pub device: String,
+    pub unit_id: u8,
+    pub baud_rate: u32,
+    pub timeout: Timeout,
+}
+
+#[derive(Deserialize, Clone, Debug)]
 pub struct Settings {
     pub mqtt: MQTTSettings,
+    pub relay: RelaySettings,
 }
 
 impl Settings {
