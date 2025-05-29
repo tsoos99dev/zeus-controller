@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
 
