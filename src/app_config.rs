@@ -1,6 +1,8 @@
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
 
+const DEFAULT_CONFIG_PATH: &str = "config/local";
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct Timeout(pub u64);
 impl Default for Timeout {
@@ -43,8 +45,9 @@ pub struct Settings {
 
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
+        let config_path = std::env::var("CONFIG_PATH").unwrap_or(DEFAULT_CONFIG_PATH.to_owned());
         let settings = Config::builder()
-            .add_source(File::with_name("config/local"))
+            .add_source(File::with_name(&config_path))
             .add_source(config::Environment::with_prefix("app"))
             .build()?;
 
