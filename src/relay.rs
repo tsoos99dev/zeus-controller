@@ -122,13 +122,13 @@ impl Interface {
             .create_ctx()
             .map_err(|e| InterfaceError::FailedToConnect(IOError(e.kind())))?;
 
-        let state = tokio::time::timeout(self.timeout, ctx.read_coils(0x0, 4))
+        let state = tokio::time::timeout(self.timeout, ctx.read_coils(0x0, 8))
             .await
             .map_err(|_| InterfaceError::Timeout)?
             .map_err(|e| RequestFailureKind::Connection(TokioModbusError(e.to_string())))?
             .map_err(|e| RequestFailureKind::Modbus(TokioModbusExceptionCode(e)))?;
 
-        let Some(state) = state.iter().cloned().collect_array() else {
+        let Some(state) = state.iter().cloned().take(4).collect_array() else {
             return Err(InterfaceError::InvalidResponse);
         };
         ctx.disconnect()
