@@ -9,9 +9,9 @@ use tokio_modbus::prelude::*;
 
 use crate::service::Service;
 
-#[derive(thiserror::Error, Clone, Debug)]
+#[derive(thiserror::Error, Debug)]
 #[error("IO Error")]
-pub struct IOError(io::ErrorKind);
+pub struct IOError(io::Error);
 
 impl Serialize for IOError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -22,7 +22,7 @@ impl Serialize for IOError {
     }
 }
 
-#[derive(thiserror::Error, Debug, Clone)]
+#[derive(thiserror::Error, Debug)]
 #[error("Modbus error")]
 pub struct TokioModbusError(String);
 
@@ -35,7 +35,7 @@ impl Serialize for TokioModbusError {
     }
 }
 
-#[derive(thiserror::Error, Clone, Debug)]
+#[derive(thiserror::Error, Debug)]
 #[error(transparent)]
 pub struct TokioModbusExceptionCode(tokio_modbus::ExceptionCode);
 
@@ -48,7 +48,7 @@ impl Serialize for TokioModbusExceptionCode {
     }
 }
 
-#[derive(thiserror::Error, Debug, Clone, Serialize)]
+#[derive(thiserror::Error, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestFailureKind {
     #[error("Request failed")]
@@ -58,7 +58,7 @@ pub enum RequestFailureKind {
     Modbus(#[source] TokioModbusExceptionCode),
 }
 
-#[derive(thiserror::Error, Debug, Clone, Serialize)]
+#[derive(thiserror::Error, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterfaceError {
     #[error("Failed to connect to relay")]
@@ -77,10 +77,10 @@ pub enum InterfaceError {
     InvalidResponse,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize)]
 pub struct State([bool; 4]);
 
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 pub enum Command {
     #[serde(alias = "set")]
     SetOutput { number: u16, value: bool },
@@ -89,7 +89,7 @@ pub enum Command {
     ReadStatus,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
     Success,
@@ -99,7 +99,7 @@ pub enum Response {
     Status(State),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Interface {
     device: String,
     unit_id: u8,
@@ -120,7 +120,7 @@ impl Interface {
     pub async fn read_status(&self) -> Result<State, InterfaceError> {
         let mut ctx = self
             .create_ctx()
-            .map_err(|e| InterfaceError::FailedToConnect(IOError(e.kind())))?;
+            .map_err(|e| InterfaceError::FailedToConnect(IOError(e)))?;
 
         let state = tokio::time::timeout(self.timeout, ctx.read_coils(0x0, 8))
             .await
@@ -133,7 +133,7 @@ impl Interface {
         };
         ctx.disconnect()
             .await
-            .map_err(|e| InterfaceError::FailedToDisconnect(IOError(e.kind())))?;
+            .map_err(|e| InterfaceError::FailedToDisconnect(IOError(e)))?;
 
         Ok(State(state))
     }
@@ -141,7 +141,7 @@ impl Interface {
     pub async fn set_output(&self, number: u16, value: bool) -> Result<(), InterfaceError> {
         let mut ctx = self
             .create_ctx()
-            .map_err(|e| InterfaceError::FailedToConnect(IOError(e.kind())))?;
+            .map_err(|e| InterfaceError::FailedToConnect(IOError(e)))?;
 
         tokio::time::timeout(self.timeout, ctx.write_single_coil(number, value))
             .await
@@ -151,7 +151,7 @@ impl Interface {
 
         ctx.disconnect()
             .await
-            .map_err(|e| InterfaceError::FailedToDisconnect(IOError(e.kind())))?;
+            .map_err(|e| InterfaceError::FailedToDisconnect(IOError(e)))?;
 
         Ok(())
     }

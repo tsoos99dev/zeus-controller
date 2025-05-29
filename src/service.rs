@@ -15,10 +15,18 @@ pub enum ServiceError {
     SenderGone,
 }
 
-#[derive(Clone)]
 pub struct Proxy<M, R> {
     sender: mpsc::Sender<(M, oneshot::Sender<R>)>,
     token: CancellationToken,
+}
+
+impl<M, R> Clone for Proxy<M, R> {
+    fn clone(&self) -> Self {
+        Proxy {
+            sender: self.sender.clone(),
+            token: self.token.clone(),
+        }
+    }
 }
 
 impl<M, R> Proxy<M, R> {
@@ -32,9 +40,9 @@ impl<M, R> Proxy<M, R> {
         Ok(response)
     }
 
-    pub fn stop(self) {
-        self.token.cancel();
-    }
+    // pub fn stop(self) {
+    //     self.token.cancel();
+    // }
 }
 
 pub trait Service

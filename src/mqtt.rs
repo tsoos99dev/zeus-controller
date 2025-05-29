@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap, future::Future, pin::Pin, string::FromUtf8Error, sync::Arc,
+    collections::HashMap, fmt::Debug, future::Future, pin::Pin, string::FromUtf8Error, sync::Arc,
     time::Duration,
 };
 
@@ -92,8 +92,12 @@ pub enum RequestError {
 
     #[error("Missing correlation data")]
     MissingCorrelationData,
+
     #[error("Invalid request format")]
     InvalidRequestFormat(#[from] serde_json::Error),
+
+    #[error("Unexpected error")]
+    Unexpected,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -192,11 +196,12 @@ impl Interface {
         Ok(())
     }
 
-    pub async fn add_handler<F, O, M, R>(&self, topic: &str, func: F) -> Result<(), ClientError>
+    pub async fn add_handler<F, O, M, R, E>(&self, topic: &str, func: F) -> Result<(), ClientError>
     where
         M: for<'a> Deserialize<'a>,
         R: Serialize,
-        O: Future<Output = R> + Send,
+        E: Debug,
+        O: Future<Output = Result<R, E>> + Send,
         F: Fn(M) -> O + Send + Sync + 'static,
     {
         let mut handlers = self.handlers.lock().await;
@@ -207,7 +212,10 @@ impl Interface {
                 let func = func_ref.clone();
                 Box::pin(async move {
                     let message = serde_json::from_slice(&request)?;
-                    let response = func(message).await;
+                    let response = func(message)
+                        .await
+                        .inspect_err(|e| tracing::error!("Handler failed: {e:?}"))
+                        .map_err(|_| RequestError::Unexpected)?;
                     let response = serde_json::to_vec(&response)?;
                     Ok(response.into())
                 })
