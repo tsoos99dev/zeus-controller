@@ -1,6 +1,5 @@
 mod app_config;
 mod mqtt;
-mod ops;
 mod relay;
 mod service;
 
@@ -51,7 +50,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relay_proxy = relay_interface.spawn();
 
     mqtt_interface
-        .add_handler("relay/command", relay_proxy.clone())
+        .add_handler("relay/command", move |request| {
+            let proxy = relay_proxy.clone();
+            async move { proxy.send(request).await }
+        })
         .await?;
 
     tracker.spawn(async move {
@@ -71,7 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::debug!("Shutting down...");
     token.cancel();
-    relay_proxy.stop();
 
     tracing::debug!("Waiting for background tasks to finish...");
     tracker.wait().await;

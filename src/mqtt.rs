@@ -24,15 +24,14 @@ use rumqttc::{
     Transport,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore};
-use tokio_rustls::rustls::pki_types;
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
-
-use crate::{
-    app_config::{MQTTSettings, TLSSettings},
-    ops::AsyncFn,
-    service::{Proxy, ServiceError},
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::error::Elapsed,
 };
+use tokio_rustls::rustls::pki_types;
+use tokio_util::sync::CancellationToken;
+
+use crate::app_config::{MQTTSettings, TLSSettings};
 
 // Number of messages allowed in the async client's buffer
 const CLIENT_CHANNEL_CAPACITY: usize = 20;
@@ -46,44 +45,15 @@ const REQUEST_CONCURRENCY: usize = 5;
 // Max number of seconds to wait for an available handler before the packet is dropped
 const REQUEST_WAIT_PERIOD: u64 = 2;
 
-#[typetag::deserialize]
-pub trait Request {}
+// Max number of seconds to wait for a disconnect confirmation
+const DISCONNECT_WAIT_PERIOD: u64 = 5;
 
-#[typetag::serialize]
-pub trait Response {}
-
-type RequestProxyRegistry = Arc<
-    Mutex<
-        HashMap<
-            String,
-            Box<dyn AsyncFn<Args = Bytes, Ret = Result<Bytes, RequestError>> + Send + Sync>,
-        >,
-    >,
+type RequestHandler = Arc<
+    dyn Fn(Bytes) -> Pin<Box<dyn Future<Output = Result<Bytes, RequestError>> + Send>>
+        + Send
+        + Sync,
 >;
-
-// impl<T, F> AsyncFnOnce for T
-// where
-//     T: FnOnce(&Bytes) -> F,
-//     F: Future<Output = Bytes> + Send + Sync + 'static,
-// {
-//     type Args = Bytes;
-//     type Ret = Bytes;
-//     fn call(self, args: Bytes) -> Pin<Box<dyn Future<Output = Bytes> + Send + Sync>> {
-//         Box::pin(self(&args))
-//     }
-// }
-
-impl<T, F> AsyncFn for T
-where
-    T: Fn(Bytes) -> F,
-    F: Future<Output = Result<Bytes, RequestError>> + Send + Sync + 'static,
-{
-    type Args = Bytes;
-    type Ret = Result<Bytes, RequestError>;
-    fn call(&self, args: Self::Args) -> Pin<Box<dyn Future<Output = Self::Ret> + Send + Sync>> {
-        Box::pin(self(args))
-    }
-}
+type RequestHandlerRegistry = Arc<Mutex<HashMap<String, RequestHandler>>>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum TLSSettingError {
@@ -124,9 +94,6 @@ pub enum RequestError {
     MissingCorrelationData,
     #[error("Invalid request format")]
     InvalidRequestFormat(#[from] serde_json::Error),
-
-    #[error("Handler failed")]
-    HandlerFailed(#[from] ServiceError),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -136,6 +103,9 @@ pub enum InterfaceError {
 
     #[error("Couldn't disconnect cleanly")]
     DisconnectFailed(#[from] Box<ClientError>),
+
+    #[error("Couldn't disconnect cleanly")]
+    DisconnectTimeout(#[from] Elapsed),
 
     #[error("Executor already running")]
     AlreadyRunning,
@@ -172,9 +142,8 @@ fn set_tls_settings(
 pub struct Interface {
     client: AsyncClient,
     executor: Option<InterfaceExecutor>,
-    proxies: RequestProxyRegistry,
+    handlers: RequestHandlerRegistry,
     token: CancellationToken,
-    internal_token: CancellationToken,
 }
 
 impl Interface {
@@ -189,79 +158,61 @@ impl Interface {
             set_tls_settings(&mut options, tls_settings)?;
         }
 
-        let internal_token = CancellationToken::new();
-
         let (client, eventloop) = AsyncClient::new(options.clone(), CLIENT_CHANNEL_CAPACITY);
 
-        let proxies = Arc::new(Mutex::new(HashMap::new()));
+        let handlers = Arc::new(Mutex::new(HashMap::new()));
         let executor = InterfaceExecutor {
-            eventloop,
-            request_handler: RequestHandler::new(client.clone(), proxies.clone()),
-            token: internal_token.clone(),
+            client: client.clone(),
+            eventloop: Arc::new(Mutex::new(eventloop)),
+            handlers: handlers.clone(),
+            request_semaphore: Arc::new(Semaphore::new(REQUEST_CONCURRENCY)),
         };
 
         Ok(Interface {
             client,
             executor: Some(executor),
-            proxies,
+            handlers,
             token,
-            internal_token,
         })
     }
 
     pub async fn run(&mut self) -> Result<(), InterfaceError> {
-        let tracker = TaskTracker::new();
-
         let mut executor = self.executor.take().ok_or(InterfaceError::AlreadyRunning)?;
 
-        let internal_token_clone = self.internal_token.clone();
-
-        tracker.spawn(async move {
-            tokio::select! {
-                _ = executor.poll() => {},
-                _ = internal_token_clone.cancelled() => {}
-            }
-        });
-
-        self.token.cancelled().await;
-
-        tracker.close();
-
-        let state = self
-            .client
-            .disconnect()
-            .await
-            .map_err(|e| InterfaceError::DisconnectFailed(Box::new(e)));
-
-        if state.is_err() {
-            self.internal_token.cancel();
+        tokio::select! {
+            _ = executor.poll() => {},
+            _ = self.token.cancelled() => {}
         }
 
-        tracker.wait().await;
-        state
+        self.client
+            .disconnect()
+            .await
+            .map_err(|e| InterfaceError::DisconnectFailed(Box::new(e)))?;
+        tokio::time::timeout(Duration::from_secs(DISCONNECT_WAIT_PERIOD), executor.poll()).await?;
+        Ok(())
     }
 
-    pub async fn add_handler<M, R>(
-        &self,
-        topic: &str,
-        proxy: Proxy<M, R>,
-    ) -> Result<(), ClientError>
+    pub async fn add_handler<F, O, M, R>(&self, topic: &str, func: F) -> Result<(), ClientError>
     where
-        M: for<'a> Deserialize<'a> + Clone + Send + Sync + 'static,
-        R: Serialize + Clone + Send + Sync + 'static,
+        M: for<'a> Deserialize<'a>,
+        R: Serialize,
+        O: Future<Output = R> + Send,
+        F: Fn(M) -> O + Send + Sync + 'static,
     {
-        let mut proxies = self.proxies.lock().await;
-        let converter = Box::new(move |request: Bytes| {
-            let proxy = proxy.clone();
-            async move {
-                let message = serde_json::from_slice(&request)?;
-                let response = proxy.send(message).await?;
-                let response = serde_json::to_vec(&response)?;
-                Ok(response.into())
-            }
-        });
-
-        proxies.insert(topic.into(), converter);
+        let mut handlers = self.handlers.lock().await;
+        let func_ref = Arc::new(func);
+        handlers.insert(
+            topic.into(),
+            Arc::new(move |request| {
+                let func = func_ref.clone();
+                Box::pin(async move {
+                    let message = serde_json::from_slice(&request)?;
+                    let response = func(message).await;
+                    let response = serde_json::to_vec(&response)?;
+                    Ok(response.into())
+                })
+            }),
+        );
         self.client.subscribe(topic, QoS::AtMostOnce).await?;
         Ok(())
     }
@@ -274,15 +225,17 @@ impl Interface {
 }
 
 struct InterfaceExecutor {
-    eventloop: EventLoop,
-    request_handler: RequestHandler,
-    token: CancellationToken,
+    client: AsyncClient,
+    eventloop: Arc<Mutex<EventLoop>>,
+    handlers: RequestHandlerRegistry,
+    request_semaphore: Arc<Semaphore>,
 }
 
 impl InterfaceExecutor {
     async fn poll(&mut self) {
+        let mut eventloop = self.eventloop.lock().await;
         loop {
-            let event = self.eventloop.poll().await;
+            let event = eventloop.poll().await;
             match event {
                 Ok(notification) => {
                     tracing::debug!("Received = {notification:?}");
@@ -295,10 +248,10 @@ impl InterfaceExecutor {
                         }
                         Event::Outgoing(Outgoing::Disconnect) => {
                             tracing::info!("Disconnecting...");
-                            self.token.cancel();
+                            break;
                         }
                         Event::Incoming(Packet::Publish(packet)) => {
-                            if let Err(e) = self.request_handler.accept(packet).await {
+                            if let Err(e) = self.accept(packet).await {
                                 tracing::error!("Failed to process request: {e:?}");
                             };
                         }
@@ -310,23 +263,6 @@ impl InterfaceExecutor {
                     tokio::time::sleep(Duration::from_secs(RETRY_DELAY)).await;
                 }
             }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RequestHandler {
-    client: AsyncClient,
-    proxies: RequestProxyRegistry,
-    request_semaphore: Arc<Semaphore>,
-}
-
-impl RequestHandler {
-    fn new(client: AsyncClient, proxies: RequestProxyRegistry) -> Self {
-        RequestHandler {
-            client,
-            proxies,
-            request_semaphore: Arc::new(Semaphore::new(REQUEST_CONCURRENCY)),
         }
     }
 
@@ -350,16 +286,17 @@ impl RequestHandler {
             .correlation_data
             .ok_or(RequestError::MissingCorrelationData)?;
 
-        let proxies = self.proxies.clone();
         let client = self.client.clone();
 
-        tokio::spawn(async move {
-            let proxies = proxies.lock().await;
-            let Some(proxy) = proxies.get(&topic) else {
-                return;
-            };
+        let handlers = self.handlers.lock().await;
+        let Some(handler) = handlers.get(&topic) else {
+            return Ok(());
+        };
 
-            let response = match proxy.call(packet.payload).await {
+        let handler = handler.clone();
+
+        tokio::spawn(async move {
+            let response = match handler(packet.payload).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("Request handler failed: {e:?}");
@@ -390,3 +327,21 @@ impl RequestHandler {
         Ok(())
     }
 }
+
+// #[derive(Clone)]
+// struct RequestHandler {
+//     client: AsyncClient,
+//     proxies: RequestProxyRegistry,
+//     request_semaphore: Arc<Semaphore>,
+// }
+
+// impl RequestHandler {
+//     fn new(client: AsyncClient, proxies: RequestProxyRegistry) -> Self {
+//         RequestHandler {
+//             client,
+//             proxies,
+//             request_semaphore: Arc::new(Semaphore::new(REQUEST_CONCURRENCY)),
+//         }
+//     }
+
+// }
