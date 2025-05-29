@@ -1,6 +1,7 @@
 use std::{io, time::Duration};
 
 use client::Context;
+use itertools::Itertools;
 use serde::{self, Deserialize, Serialize};
 use tokio_serial::SerialStream;
 
@@ -71,15 +72,21 @@ pub enum InterfaceError {
 
     #[error("Failed to disconnect")]
     FailedToDisconnect(#[source] IOError),
+
+    #[error("Invalid response")]
+    InvalidResponse,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct State([bool; 4]);
 
 #[derive(Clone, Deserialize)]
 pub enum Command {
     #[serde(alias = "set")]
     SetOutput { number: u16, value: bool },
+
+    #[serde(alias = "status")]
+    ReadStatus,
 }
 
 #[derive(Clone, Serialize)]
@@ -87,6 +94,9 @@ pub enum Command {
 pub enum Response {
     Success,
     Failure(InterfaceError),
+
+    #[serde(untagged)]
+    Status(State),
 }
 
 #[derive(Clone, Debug)]
@@ -107,24 +117,26 @@ impl Interface {
         }
     }
 
-    // pub async fn read_status(&self) -> Result<RelayState, RelayInterfaceError> {
-    //     let mut ctx = self
-    //         .create_ctx()
-    //         .map_err(RelayInterfaceError::FailedToConnect)?;
-    //     let state = ctx
-    //         .read_coils(0x083D, 4)
-    //         .await
-    //         .map_err(RequestFailureKind::Connection)?
-    //         .map_err(RequestFailureKind::Modbus)?;
-    //     let Some((r1, r2, r3, r4)) = state.iter().collect_tuple() else {
-    //         return Err(RelayInterfaceError::InvalidResponse);
-    //     };
-    //     ctx.disconnect()
-    //         .await
-    //         .map_err(RelayInterfaceError::FailedToDisconnect)?;
+    pub async fn read_status(&self) -> Result<State, InterfaceError> {
+        let mut ctx = self
+            .create_ctx()
+            .map_err(|e| InterfaceError::FailedToConnect(IOError(e.kind())))?;
 
-    //     Ok(RelayState(*r1, *r2, *r3, *r4))
-    // }
+        let state = tokio::time::timeout(self.timeout, ctx.read_coils(0x0, 4))
+            .await
+            .map_err(|_| InterfaceError::Timeout)?
+            .map_err(|e| RequestFailureKind::Connection(TokioModbusError(e.to_string())))?
+            .map_err(|e| RequestFailureKind::Modbus(TokioModbusExceptionCode(e)))?;
+
+        let Some(state) = state.iter().cloned().collect_array() else {
+            return Err(InterfaceError::InvalidResponse);
+        };
+        ctx.disconnect()
+            .await
+            .map_err(|e| InterfaceError::FailedToDisconnect(IOError(e.kind())))?;
+
+        Ok(State(state))
+    }
 
     pub async fn set_output(&self, number: u16, value: bool) -> Result<(), InterfaceError> {
         let mut ctx = self
@@ -163,6 +175,13 @@ impl Service for Interface {
                 let result = self.set_output(number, value).await;
                 match result {
                     Ok(_) => Response::Success,
+                    Err(e) => Response::Failure(e),
+                }
+            }
+            Command::ReadStatus => {
+                let result = self.read_status().await;
+                match result {
+                    Ok(state) => Response::Status(state),
                     Err(e) => Response::Failure(e),
                 }
             }
